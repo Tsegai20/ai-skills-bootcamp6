@@ -2,10 +2,10 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Dict, List, Optional
 import torch
-from transformers import DistilBertTokenizer, DistilBertForSequenceClassification
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from torch.utils.data import Dataset, DataLoader
-import numpy as np
 import pandas as pd
+import numpy as np
 import requests
 import time
 import os
@@ -18,28 +18,29 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="Federated Learning Aggregator")
 
 SITES = {
-    "site_a": os.getenv("SITE_A_URL", "http://site_a:8000"),
-    "site_b": os.getenv("SITE_B_URL", "http://site_b:8000"),
-    "site_c": os.getenv("SITE_C_URL", "http://site_c:8000"),
-    "site_d": os.getenv("SITE_D_URL", "http://site_d:8000"),
+    "site_a": os.getenv("SITE_A_URL", "http://host.docker.internal:8001"),
+    "site_b": os.getenv("SITE_B_URL", "http://host.docker.internal:8002"),
+    "site_c": os.getenv("SITE_C_URL", "http://host.docker.internal:8003"),
+    "site_d": os.getenv("SITE_D_URL", "http://host.docker.internal:8004"),
 }
 
-MODEL_NAME  = "distilbert-base-uncased"
+MODEL_NAME  = "prajjwal1/bert-tiny"
 NUM_LABELS  = 4
 LABEL_NAMES = ["World", "Sports", "Business", "Sci/Tech"]
 TEST_PATH   = os.getenv("TEST_DATA_PATH", "/data/test.csv")
+WEIGHTS_DIR = os.getenv("WEIGHTS_DIR", "/data/weights")
 MLFLOW_URI  = os.getenv("MLFLOW_URI", "sqlite:////mlflow/mlflow.db")
 DEVICE      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-model     = None
-tokenizer = None
-test_df   = None
-history   = []
-is_training = False
+model         = None
+tokenizer     = None
+test_df       = None
+history       = []
+is_training   = False
 current_round = 0
 
 mlflow.set_tracking_uri(MLFLOW_URI)
-mlflow.set_experiment("Federated_Learning")
+mlflow.set_experiment("Federated_Learning_Docker")
 
 class NewsDataset(Dataset):
     def __init__(self, texts, labels, tokenizer, max_len=128):
@@ -59,37 +60,44 @@ class NewsDataset(Dataset):
 def load_resources():
     global model, tokenizer, test_df
     if tokenizer is None:
-        tokenizer = DistilBertTokenizer.from_pretrained(MODEL_NAME)
+        logger.info("Loading bert-tiny tokenizer...")
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     if test_df is None:
         test_df = pd.read_csv(TEST_PATH)
         logger.info(f"Loaded {len(test_df)} test samples")
     if model is None:
-        model = DistilBertForSequenceClassification.from_pretrained(
+        logger.info("Loading bert-tiny model...")
+        model = AutoModelForSequenceClassification.from_pretrained(
             MODEL_NAME, num_labels=NUM_LABELS
         ).to(DEVICE)
+        os.makedirs(WEIGHTS_DIR, exist_ok=True)
+        torch.save(model.state_dict(), os.path.join(WEIGHTS_DIR, "global_weights.pt"))
+        size = os.path.getsize(os.path.join(WEIGHTS_DIR, "global_weights.pt")) / 1024
+        logger.info(f"Saved initial global weights ({size:.0f} KB)")
     return model, tokenizer, test_df
 
-def weights_to_dict(state_dict):
-    return {k: v.cpu().numpy().tolist() for k, v in state_dict.items()}
-
-def dict_to_weights(d):
-    return {k: torch.tensor(v) for k, v in d.items()}
-
-def fedavg(results):
-    total = sum(r["num_samples"] for r in results)
-    weights = [r["num_samples"] / total for r in results]
+def fedavg(site_names):
+    states = []
+    for site_name in site_names:
+        path = os.path.join(WEIGHTS_DIR, f"{site_name}_weights.pt")
+        if os.path.exists(path):
+            state = torch.load(path, map_location=DEVICE, weights_only=True)
+            states.append(state)
+            logger.info(f"Loaded {path}")
+        else:
+            logger.warning(f"Missing weights for {site_name}")
+    if not states:
+        raise ValueError("No site weights found")
+    w = 1.0 / len(states)
     averaged = {}
-    for key in results[0]["weights"].keys():
-        averaged[key] = sum(
-            w * torch.tensor(r["weights"][key]).float()
-            for w, r in zip(weights, results)
-        )
+    for key in states[0].keys():
+        averaged[key] = sum(w * s[key].float() for s in states)
     return averaged
 
 def evaluate(m, tok, df):
     m.eval()
     dataset = NewsDataset(df["text"].tolist(), df["label"].tolist(), tok)
-    loader = DataLoader(dataset, batch_size=64)
+    loader  = DataLoader(dataset, batch_size=64)
     all_preds, all_labels = [], []
     with torch.no_grad():
         for batch in loader:
@@ -97,42 +105,40 @@ def evaluate(m, tok, df):
                 input_ids=batch["input_ids"].to(DEVICE),
                 attention_mask=batch["attention_mask"].to(DEVICE)
             )
-            preds = out.logits.argmax(dim=-1).cpu().numpy()
-            all_preds.extend(preds)
+            all_preds.extend(out.logits.argmax(dim=-1).cpu().numpy())
             all_labels.extend(batch["labels"].numpy())
     all_preds  = np.array(all_preds)
     all_labels = np.array(all_labels)
-    accuracy = (all_preds == all_labels).mean()
-    per_class = {}
+    accuracy   = float((all_preds == all_labels).mean())
+    per_class  = {}
     for i, name in enumerate(LABEL_NAMES):
         mask = all_labels == i
         if mask.sum() > 0:
             per_class[name] = float((all_preds[mask] == all_labels[mask]).mean())
-    return float(accuracy), per_class
+    return accuracy, per_class
 
 class RoundConfig(BaseModel):
     epochs: int = 1
-    batch_size: int = 32
     lr: float = 2e-5
     timeout: int = 600
 
 class MultiRoundConfig(BaseModel):
     num_rounds: int = 5
     epochs: int = 1
-    batch_size: int = 32
     lr: float = 2e-5
     timeout: int = 600
 
 @app.get("/")
 def health():
     return {
-        "status": "healthy",
-        "service": "FL Aggregator",
-        "current_round": current_round,
-        "is_training": is_training,
+        "status":            "healthy",
+        "service":           "FL Aggregator",
+        "model":             MODEL_NAME,
+        "current_round":     current_round,
+        "is_training":       is_training,
         "total_rounds_done": len(history),
-        "sites": list(SITES.keys()),
-        "device": str(DEVICE)
+        "sites":             list(SITES.keys()),
+        "device":            str(DEVICE)
     }
 
 @app.get("/sites")
@@ -149,8 +155,8 @@ def sites_status():
 @app.get("/history")
 def get_history():
     return {
-        "total_rounds": len(history),
-        "history": history,
+        "total_rounds":  len(history),
+        "history":       history,
         "best_accuracy": max((r["global_accuracy"] for r in history), default=0)
     }
 
@@ -161,40 +167,33 @@ def run_round(config: RoundConfig = RoundConfig()):
     if is_training:
         raise HTTPException(409, "Training already in progress")
 
-    is_training = True
+    is_training    = True
     current_round += 1
-    round_num = current_round
-    t0 = time.time()
+    round_num      = current_round
+    t0             = time.time()
 
     try:
         m, tok, test = load_resources()
-        global_weights = weights_to_dict(m.state_dict())
 
+        global_weights_path = os.path.join(WEIGHTS_DIR, "global_weights.pt")
+        torch.save(m.state_dict(), global_weights_path)
+        size_kb = os.path.getsize(global_weights_path) / 1024
+        logger.info(f"Written global weights {size_kb:.0f} KB to shared volume")
         logger.info(f"Starting round {round_num}")
 
-        # Send to all sites
         site_results = []
         for site_name, site_url in SITES.items():
             try:
-                logger.info(f"  Sending to {site_name}...")
+                logger.info(f"  Requesting training from {site_name}...")
                 resp = requests.post(
                     f"{site_url}/train",
-                    json={
-                        "weights":    global_weights,
-                        "round_num":  round_num,
-                        "epochs":     config.epochs,
-                        "batch_size": config.batch_size,
-                        "lr":         config.lr
-                    },
+                    json={"round_num": round_num, "epochs": config.epochs, "lr": config.lr},
                     timeout=config.timeout
                 )
                 if resp.status_code == 200:
                     result = resp.json()
                     site_results.append(result)
-                    logger.info(
-                        f"  {site_name}: acc={result['local_accuracy']:.4f} "
-                        f"t={result['training_time']:.1f}s"
-                    )
+                    logger.info(f"  {site_name}: acc={result['local_accuracy']:.4f} t={result['training_time']:.1f}s")
                 else:
                     logger.error(f"  {site_name} error: {resp.text[:100]}")
             except Exception as e:
@@ -203,64 +202,46 @@ def run_round(config: RoundConfig = RoundConfig()):
         if not site_results:
             raise HTTPException(500, "All sites failed")
 
-        # FedAvg
-        logger.info("FedAvg aggregation...")
-        averaged = fedavg(site_results)
+        logger.info(f"FedAvg from {len(site_results)} sites...")
+        responded = [r["site_name"] for r in site_results]
+        averaged  = fedavg(responded)
         m.load_state_dict(averaged)
+        torch.save(m.state_dict(), global_weights_path)
+        logger.info("Updated global weights saved")
 
-        # Evaluate
         logger.info("Evaluating global model...")
         global_acc, per_class = evaluate(m, tok, test)
 
-        elapsed = time.time() - t0
-        prev_acc = history[-1]["global_accuracy"] if history else 0.0
+        elapsed     = time.time() - t0
+        prev_acc    = history[-1]["global_accuracy"] if history else 0.0
         improvement = global_acc - prev_acc
 
-        # MLflow logging
-        with mlflow.start_run(run_name=f"round_{round_num}"):
-            mlflow.log_params({
-                "round": round_num,
-                "num_sites": len(site_results),
-                "epochs": config.epochs
-            })
-            mlflow.log_metrics({
-                "global_accuracy": global_acc,
-                "improvement": improvement,
-                "round_time": elapsed
-            })
-            for r in site_results:
-                mlflow.log_metric(
-                    f"{r['site_name']}_accuracy",
-                    r["local_accuracy"],
-                    step=round_num
-                )
+        try:
+            with mlflow.start_run(run_name=f"round_{round_num}"):
+                mlflow.log_params({"round": round_num, "model": MODEL_NAME, "sites": len(site_results)})
+                mlflow.log_metrics({"global_accuracy": global_acc, "improvement": improvement, "round_time": elapsed})
+                for r in site_results:
+                    mlflow.log_metric(f"{r['site_name']}_accuracy", r["local_accuracy"], step=round_num)
+        except Exception as e:
+            logger.warning(f"MLflow logging failed: {e}")
 
         round_result = {
-            "round_num":         round_num,
-            "global_accuracy":   global_acc,
+            "round_num":          round_num,
+            "global_accuracy":    global_acc,
             "per_class_accuracy": per_class,
-            "improvement":       improvement,
-            "round_time":        elapsed,
-            "sites_responded":   len(site_results),
+            "improvement":        improvement,
+            "round_time":         elapsed,
+            "sites_responded":    len(site_results),
             "site_results": [
-                {
-                    "site":           r["site_name"],
-                    "local_accuracy": r["local_accuracy"],
-                    "training_time":  r["training_time"],
-                    "num_samples":    r["num_samples"]
-                }
+                {"site": r["site_name"], "local_accuracy": r["local_accuracy"],
+                 "training_time": r["training_time"], "num_samples": r["num_samples"]}
                 for r in site_results
             ]
         }
 
         history.append(round_result)
         is_training = False
-
-        logger.info(
-            f"Round {round_num} done. "
-            f"Global: {global_acc:.4f} ({improvement:+.4f}) in {elapsed:.1f}s"
-        )
-
+        logger.info(f"Round {round_num} done. Global: {global_acc:.4f} ({improvement:+.4f}) in {elapsed:.1f}s")
         return round_result
 
     except Exception as e:
@@ -273,19 +254,13 @@ def run_multi_round(config: MultiRoundConfig = MultiRoundConfig()):
     results = []
     for i in range(config.num_rounds):
         logger.info(f"Starting round {i+1}/{config.num_rounds}")
-        result = run_round(RoundConfig(
-            epochs=config.epochs,
-            batch_size=config.batch_size,
-            lr=config.lr,
-            timeout=config.timeout
-        ))
+        result = run_round(RoundConfig(epochs=config.epochs, lr=config.lr, timeout=config.timeout))
         results.append(result)
-
     best = max(results, key=lambda x: x["global_accuracy"])
     return {
-        "total_rounds":    config.num_rounds,
-        "final_accuracy":  results[-1]["global_accuracy"],
-        "best_accuracy":   best["global_accuracy"],
-        "best_round":      best["round_num"],
-        "results":         results
+        "total_rounds":   config.num_rounds,
+        "final_accuracy": results[-1]["global_accuracy"],
+        "best_accuracy":  best["global_accuracy"],
+        "best_round":     best["round_num"],
+        "results":        results
     }

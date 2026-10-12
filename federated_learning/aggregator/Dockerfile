@@ -2,13 +2,9 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir     fastapi==0.115.0     uvicorn==0.30.6     transformers==4.44.2     "torch==2.4.1+cpu"     pandas==2.2.2     pydantic==2.8.2     requests==2.32.3     "mlflow==2.16.0"     "sqlalchemy==1.4.53"     --extra-index-url https://download.pytorch.org/whl/cpu
 
-# Pre-download model
-RUN python -c "from transformers import DistilBertTokenizer, DistilBertForSequenceClassification; \
-    DistilBertTokenizer.from_pretrained('distilbert-base-uncased'); \
-    DistilBertForSequenceClassification.from_pretrained('distilbert-base-uncased', num_labels=4)"
+RUN python -c "from transformers import AutoTokenizer, AutoModelForSequenceClassification;     AutoTokenizer.from_pretrained('prajjwal1/bert-tiny');     AutoModelForSequenceClassification.from_pretrained('prajjwal1/bert-tiny', num_labels=4);     print('bert-tiny cached successfully')"
 
 COPY app.py .
 

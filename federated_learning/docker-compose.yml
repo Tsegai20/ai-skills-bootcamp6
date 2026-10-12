@@ -3,74 +3,94 @@ services:
   site_a:
     build: ./site
     container_name: fl_site_a
+    ports:
+      - "8001:8000"
     environment:
       - SITE_NAME=site_a
       - SITE_CLASS=0
       - DATA_PATH=/data/site_a.csv
+      - WEIGHTS_DIR=/data/weights
+      - TRANSFORMERS_OFFLINE=1
+      - HF_DATASETS_OFFLINE=1
     volumes:
       - ./data:/data
     networks:
       - fl_network
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/')"]
       interval: 30s
       timeout: 10s
       retries: 5
-      start_period: 60s
+      start_period: 30s
 
   site_b:
     build: ./site
     container_name: fl_site_b
+    ports:
+      - "8002:8000"
     environment:
       - SITE_NAME=site_b
       - SITE_CLASS=1
       - DATA_PATH=/data/site_b.csv
+      - WEIGHTS_DIR=/data/weights
+      - TRANSFORMERS_OFFLINE=1
+      - HF_DATASETS_OFFLINE=1
     volumes:
       - ./data:/data
     networks:
       - fl_network
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/')"]
       interval: 30s
       timeout: 10s
       retries: 5
-      start_period: 60s
+      start_period: 30s
 
   site_c:
     build: ./site
     container_name: fl_site_c
+    ports:
+      - "8003:8000"
     environment:
       - SITE_NAME=site_c
       - SITE_CLASS=2
       - DATA_PATH=/data/site_c.csv
+      - WEIGHTS_DIR=/data/weights
+      - TRANSFORMERS_OFFLINE=1
+      - HF_DATASETS_OFFLINE=1
     volumes:
       - ./data:/data
     networks:
       - fl_network
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/')"]
       interval: 30s
       timeout: 10s
       retries: 5
-      start_period: 60s
+      start_period: 30s
 
   site_d:
     build: ./site
     container_name: fl_site_d
+    ports:
+      - "8004:8000"
     environment:
       - SITE_NAME=site_d
       - SITE_CLASS=3
       - DATA_PATH=/data/site_d.csv
+      - WEIGHTS_DIR=/data/weights
+      - TRANSFORMERS_OFFLINE=1
+      - HF_DATASETS_OFFLINE=1
     volumes:
       - ./data:/data
     networks:
       - fl_network
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/')"]
       interval: 30s
       timeout: 10s
       retries: 5
-      start_period: 60s
+      start_period: 30s
 
   aggregator:
     build: ./aggregator
@@ -78,17 +98,22 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - SITE_A_URL=http://site_a:8000
-      - SITE_B_URL=http://site_b:8000
-      - SITE_C_URL=http://site_c:8000
-      - SITE_D_URL=http://site_d:8000
+      - SITE_A_URL=http://host.docker.internal:8001
+      - SITE_B_URL=http://host.docker.internal:8002
+      - SITE_C_URL=http://host.docker.internal:8003
+      - SITE_D_URL=http://host.docker.internal:8004
       - TEST_DATA_PATH=/data/test.csv
+      - WEIGHTS_DIR=/data/weights
       - MLFLOW_URI=sqlite:////mlflow/mlflow.db
+      - TRANSFORMERS_OFFLINE=1
+      - HF_DATASETS_OFFLINE=1
     volumes:
       - ./data:/data
       - ./mlflow:/mlflow
     networks:
       - fl_network
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       site_a:
         condition: service_healthy
@@ -99,11 +124,11 @@ services:
       site_d:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/')"]
       interval: 30s
       timeout: 10s
       retries: 5
-      start_period: 90s
+      start_period: 60s
 
   dashboard:
     build: ./dashboard
@@ -111,11 +136,13 @@ services:
     ports:
       - "8501:8501"
     environment:
-      - AGGREGATOR_URL=http://aggregator:8000
-      - SITE_A_URL=http://site_a:8000
-      - SITE_B_URL=http://site_b:8000
-      - SITE_C_URL=http://site_c:8000
-      - SITE_D_URL=http://site_d:8000
+      - AGGREGATOR_URL=http://host.docker.internal:8000
+      - SITE_A_URL=http://host.docker.internal:8001
+      - SITE_B_URL=http://host.docker.internal:8002
+      - SITE_C_URL=http://host.docker.internal:8003
+      - SITE_D_URL=http://host.docker.internal:8004
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     networks:
       - fl_network
     depends_on:
